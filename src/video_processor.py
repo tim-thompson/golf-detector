@@ -154,18 +154,27 @@ class VideoProcessor:
             
             # Draw trajectory and predicted trajectory
             if tracking_info['trajectory']:
-                # Draw actual trajectory
+                # Draw active trajectory
+                if tracking_info['is_moving']:
+                    self.trajectory_tracer.draw_trajectory(
+                        output_frame,
+                        tracking_info['trajectory'],
+                        tracking_info['prev_predicted_points'],
+                        color=(0, 255, 0),
+                        thickness=2,
+                        is_moving=True
+                    )
+            
+            # Draw completed trajectory if it exists
+            if self.ball_tracker.completed_trajectory:
                 self.trajectory_tracer.draw_trajectory(
-                    output_frame, 
-                    tracking_info['trajectory'],
+                    output_frame,
+                    self.ball_tracker.completed_trajectory,
+                    self.ball_tracker.completed_predictions,
                     color=(0, 255, 0),
-                    thickness=2
+                    thickness=2,
+                    is_moving=False
                 )
-                
-                # Draw predicted trajectory if available
-                if tracking_info['prev_predicted_points']:
-                    for point in tracking_info['prev_predicted_points']:
-                        cv2.circle(output_frame, point, 3, (0, 255, 255), -1)
             
             # Draw current ball position
             if tracking_info['ball_pos']:

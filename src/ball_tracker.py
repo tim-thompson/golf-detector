@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 from typing import Tuple, List, Optional, Dict
+from trajectory_tracer import TrajectoryTracer
 
 class BallTracker:
     def __init__(self):
@@ -18,8 +19,8 @@ class BallTracker:
         self.ball_pos = None
         self.prev_frame = None
         self.trajectory = []
-        self.predicted_points = []  # Store predicted trajectory points separately
-        self.prev_predicted_points = []  # Store previous frame's predictions
+        self.predicted_points = []
+        self.prev_predicted_points = []
         self.is_moving = False
         self.predicted_trajectory = []
         self.last_known_static_pos = None  # Store the last position where ball was static
@@ -39,9 +40,21 @@ class BallTracker:
         
         # Completed trajectory visualization
         self.completed_trajectory = []      # Store completed shot trajectory
+        self.completed_predictions = []     # Store the final predictions when shot completes
         self.frames_since_completion = 0    # Counter for frames since shot completion
         self.show_completed_frames = 120    # Show completed trajectory for ~4 seconds at 30fps
         self.fade_start_frame = 90         # Start fading after 3 seconds
+        
+        # Add prediction visualization parameters
+        self.prediction_display_frames = 30    # Show predictions for ~1 second at 30fps
+        self.prediction_fade_start = 15        # Start fading predictions after 0.5 seconds
+        self.frames_since_prediction = 0       # Counter for prediction display timing
+        
+        # Add trajectory tracer for smooth visualization
+        self.trajectory_tracer = TrajectoryTracer()
+        
+        # Add output frame
+        self.output_frame = None
     
     def _find_ball_in_search_area(self, frame: np.ndarray, search_area: np.ndarray, 
                                  x_offset: int, y_offset: int, debug_frame: np.ndarray) -> Tuple[Optional[Tuple[int, int]], Dict]:
@@ -359,8 +372,9 @@ class BallTracker:
     
     def track_frame(self, frame: np.ndarray) -> Dict:
         """Track the ball in the current frame and return tracking information."""
+        # Create both debug and clean output frames
         debug_frame = frame.copy()
-        height, width = frame.shape[:2]
+        self.output_frame = frame.copy()
         
         debug_info = {
             'main_view': debug_frame,
@@ -371,14 +385,14 @@ class BallTracker:
         }
         
         # Always check for static ball in the original search area
-        search_width = int(width * self.search_width_percent)
-        search_height = int(height * self.search_height_percent)
-        right_offset = int(width * self.search_right_offset_percent)
+        search_width = int(frame.shape[1] * self.search_width_percent)
+        search_height = int(frame.shape[0] * self.search_height_percent)
+        right_offset = int(frame.shape[1] * self.search_right_offset_percent)
         
-        x_start = (width // 2 - search_width // 2) + right_offset
-        x_start = min(x_start, width - search_width)
+        x_start = (frame.shape[1] // 2 - search_width // 2) + right_offset
+        x_start = min(x_start, frame.shape[1] - search_width)
         x_start = max(x_start, 0)
-        y_start = height - search_height - 10
+        y_start = frame.shape[0] - search_height - 10
         
         search_area = frame[y_start:y_start + search_height, x_start:x_start + search_width]
         
@@ -434,20 +448,32 @@ class BallTracker:
                 # If we've missed too many frames, reset to static detection
                 if self.consecutive_misses >= self.max_consecutive_misses:
                     print("Too many consecutive misses - resetting to static detection")
-                    # Store the completed trajectory before resetting
+                    # Store the completed trajectory and predictions before resetting
                     if len(self.trajectory) > 2:  # Only store if we have a meaningful trajectory
+                        # First, create the completed trajectory including the last predicted position
                         self.completed_trajectory = self.trajectory.copy()
+                        if hasattr(self, 'last_predicted_pos'):
+                            print("Adding last predicted position to completed trajectory")
+                            self.completed_trajectory.append(self.last_predicted_pos)
+                            
+                            # Now generate predictions using the complete trajectory
+                            print("Generating final predictions using complete trajectory")
+                            self.completed_predictions = self._predict_next_points(self.completed_trajectory)
+                        else:
+                            self.completed_predictions = self.prev_predicted_points.copy() if self.prev_predicted_points else []
+                        
                         self.frames_since_completion = 0
-                        print("Storing completed trajectory")
+                        print("Storing completed trajectory with predictions")
                     
                     self.is_moving = False
                     self.trajectory = []
                     self.predicted_points = []
+                    self.prev_predicted_points = []
                     self.consecutive_misses = 0
                     self.frames_since_static = 0
                     # Add text to debug frame
                     cv2.putText(debug_frame, "RESET - Looking for static ball", 
-                              (width//2 - 150, 60),
+                              (frame.shape[1]//2 - 150, 60),
                               cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
         
         # Update ball position and trajectory
@@ -459,147 +485,78 @@ class BallTracker:
                     print(f"Adding new trajectory point: {ball_pos}")
                     self.trajectory.append(ball_pos)
                     self.predicted_points = []  # Clear predictions when we get a new detection
+                    self.prev_predicted_points = []  # Also clear previous predictions
+                    self.frames_since_prediction = 0  # Reset prediction display counter
                     self.frames_since_lost = 0  # Reset frames since lost counter
             else:
                 # Increment frames since lost counter
                 self.frames_since_lost += 1
                 print(f"Frames since lost: {self.frames_since_lost}")
                 
-                # Generate predictions after delay if we haven't already
+                # Generate predictions after delay if needed
                 if self.frames_since_lost >= self.prediction_delay and len(self.trajectory) >= 2:
-                    # Only generate new predictions if we don't have any
-                    if not self.predicted_points:
+                    # Generate new predictions if we don't have any or if we have a new predicted search position
+                    if (not self.predicted_points or 
+                        (hasattr(self, 'last_predicted_pos') and 
+                         self.last_predicted_pos not in self.trajectory)):
                         print("Generating new predictions")
-                        self.predicted_points = self._predict_next_points(self.trajectory)
+                        # Create a temporary trajectory including the predicted search position
+                        temp_trajectory = self.trajectory.copy()
+                        if hasattr(self, 'last_predicted_pos'):
+                            temp_trajectory.append(self.last_predicted_pos)
+                        
+                        self.predicted_points = self._predict_next_points(temp_trajectory)
                         print(f"Generated {len(self.predicted_points)} predicted points")
-                    # Store current predictions as previous predictions
-                    self.prev_predicted_points = self.predicted_points.copy()
+                        # Keep the predictions visible
+                        self.prev_predicted_points = self.predicted_points
+                        # Reset the prediction display counter when generating new predictions
+                        self.frames_since_prediction = 0
                 else:
                     print(f"Not generating predictions yet - need {self.prediction_delay} frames (currently at {self.frames_since_lost})")
         
         # Draw trajectory visualization
         if len(self.trajectory) > 1:
-            # Draw actual trajectory
-            for i in range(1, len(self.trajectory)):
-                # Draw black border
-                cv2.line(debug_frame, 
-                        self.trajectory[i-1],
-                        self.trajectory[i],
-                        (0, 0, 0), 4)  # Thicker black border
-                # Draw green line
-                cv2.line(debug_frame, 
-                        self.trajectory[i-1],
-                        self.trajectory[i],
-                        (0, 255, 0), 2)
-            
-            # Draw predicted trajectory with faded effect (using previous frame's predictions)
-            if self.prev_predicted_points:
-                # Start from last actual point
-                last_actual = self.trajectory[-1]
-                for i, point in enumerate(self.prev_predicted_points):
-                    # Calculate fade factor based on prediction distance
-                    fade_factor = 0.7 * (1 - i/len(self.prev_predicted_points))  # Start at 70% opacity and fade out
-                    
-                    # Draw line from previous point
-                    prev_point = last_actual if i == 0 else self.prev_predicted_points[i-1]
-                    
-                    # Draw black border (also faded)
-                    border_color = (0, 0, 0)
-                    cv2.line(debug_frame, prev_point, point, border_color, 4)
-                    
-                    # Draw faded green line
-                    line_color = (0, int(255 * fade_factor), 0)
-                    cv2.line(debug_frame, prev_point, point, line_color, 2)
-                    
-                    # Draw faded point
-                    cv2.circle(debug_frame, point, 5, (0, 0, 0), -1)  # Black border
-                    point_color = (0, int(255 * fade_factor), int(255 * fade_factor))
-                    cv2.circle(debug_frame, point, 4, point_color, -1)
-                    
-                    # Draw frame number with fade
-                    text = f"{len(self.trajectory) + i}"
-                    (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
-                    # Black outline
-                    cv2.putText(debug_frame, text,
-                              (point[0] - text_w//2, point[1] - 6),
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 3)
-                    # Faded yellow text
-                    cv2.putText(debug_frame, text,
-                              (point[0] - text_w//2, point[1] - 6),
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.4, point_color, 1)
-            
-            # Draw points and frame numbers for actual trajectory
-            for i, point in enumerate(self.trajectory):
-                # Draw point with black border
-                cv2.circle(debug_frame, point, 5, (0, 0, 0), -1)  # Black border
-                cv2.circle(debug_frame, point, 4, (0, 255, 255), -1)  # Yellow point
+            # Draw active trajectory
+            if self.is_moving:
+                self.trajectory_tracer.draw_trajectory(
+                    debug_frame,
+                    self.trajectory,
+                    self.prev_predicted_points,
+                    color=(0, 255, 0),
+                    thickness=2,
+                    is_moving=True
+                )
                 
-                # Draw frame number with black outline for visibility
-                text = f"{i}"
-                (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
-                cv2.putText(debug_frame, text, 
-                          (point[0] - text_w//2, point[1] - 6),
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 3)  # Black outline
-                cv2.putText(debug_frame, text, 
-                          (point[0] - text_w//2, point[1] - 6),
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)  # Yellow text
-            
-            # Draw "TRACKING" status
-            cv2.putText(debug_frame, "TRACKING BALL", 
-                      (width//2 - 80, 30),
-                      cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                # Draw on output frame
+                self.trajectory_tracer.draw_trajectory(
+                    self.output_frame,
+                    self.trajectory,
+                    self.prev_predicted_points,
+                    color=(0, 255, 0),
+                    thickness=2,
+                    is_moving=True
+                )
         
-        # Draw completed trajectory if within display window
-        if self.completed_trajectory and self.frames_since_completion < self.show_completed_frames:
-            # Calculate alpha - stay solid until fade_start_frame, then fade out
-            if self.frames_since_completion < self.fade_start_frame:
-                alpha = 1.0
-            else:
-                fade_frames = self.show_completed_frames - self.fade_start_frame
-                alpha = 1.0 - ((self.frames_since_completion - self.fade_start_frame) / fade_frames)
+        # Draw completed trajectory if it exists
+        if self.completed_trajectory:
+            self.trajectory_tracer.draw_trajectory(
+                debug_frame,
+                self.completed_trajectory,
+                self.completed_predictions,
+                color=(0, 255, 0),
+                thickness=2,
+                is_moving=False
+            )
             
-            for i in range(1, len(self.completed_trajectory)):
-                # Draw black border with fading alpha
-                cv2.line(debug_frame, 
-                        self.completed_trajectory[i-1],
-                        self.completed_trajectory[i],
-                        (0, 0, 0), 4)  # Border stays solid
-                
-                # Draw green line with fading alpha
-                color = (0, int(255 * alpha), 0)  # Fade from green to black
-                cv2.line(debug_frame, 
-                        self.completed_trajectory[i-1],
-                        self.completed_trajectory[i],
-                        color, 2)
-            
-            # Draw points with fading effect
-            for i, point in enumerate(self.completed_trajectory):
-                # Draw point with fading effect
-                cv2.circle(debug_frame, point, 5, (0, 0, 0), -1)  # Black border
-                color = (0, int(255 * alpha), int(255 * alpha))  # Fade from yellow to black
-                cv2.circle(debug_frame, point, 4, color, -1)
-                
-                # Draw frame number
-                text = f"{i}"
-                (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
-                cv2.putText(debug_frame, text, 
-                          (point[0] - text_w//2, point[1] - 6),
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 3)  # Black outline
-                cv2.putText(debug_frame, text, 
-                          (point[0] - text_w//2, point[1] - 6),
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-            
-            # Add "Shot Complete" text with fading effect
-            text_color = (0, int(255 * alpha), int(255 * alpha))
-            cv2.putText(debug_frame, "Shot Complete", 
-                      (width//2 - 80, 30),
-                      cv2.FONT_HERSHEY_SIMPLEX, 1.0, text_color, 2)
-            
-            self.frames_since_completion += 1
-            
-            # Clear completed trajectory after display period
-            if self.frames_since_completion >= self.show_completed_frames:
-                self.completed_trajectory = []
+            # Draw on output frame
+            self.trajectory_tracer.draw_trajectory(
+                self.output_frame,
+                self.completed_trajectory,
+                self.completed_predictions,
+                color=(0, 255, 0),
+                thickness=2,
+                is_moving=False
+            )
         
         # Store current frame for next iteration
         self.prev_frame = frame.copy()
@@ -610,7 +567,8 @@ class BallTracker:
             'trajectory': self.trajectory.copy(),
             'predicted_points': self.predicted_points.copy() if self.predicted_points else [],
             'prev_predicted_points': self.prev_predicted_points.copy() if self.prev_predicted_points else [],
-            'debug_info': debug_info
+            'debug_info': debug_info,
+            'output_frame': self.output_frame  # Add clean output frame to return dict
         }
 
     def _track_moving_ball(self, current_frame: np.ndarray, prev_frame: np.ndarray, debug_frame: np.ndarray, debug_info: Dict) -> Optional[Tuple[int, int]]:
@@ -645,6 +603,9 @@ class BallTracker:
             predicted_x = int(p2[0] + dx)
             predicted_y = int(p2[1] + dy)
             predicted_pos = (predicted_x, predicted_y)
+            
+            # Store this predicted position for trajectory calculations
+            self.last_predicted_pos = predicted_pos
             
             # Draw prediction on debug frame
             cv2.circle(debug_frame, predicted_pos, 5, (0, 255, 255), -1)  # Yellow dot
@@ -865,6 +826,7 @@ class BallTracker:
         self.max_static_loss_frames = 2
         self.consecutive_misses = 0
         self.completed_trajectory = []
+        self.completed_predictions = []
         self.frames_since_completion = 0
-        self.recent_motion_areas = []
+        self.recent_motion_areas = [] 
         self.frames_since_lost = 0  # Reset frames since lost counter
