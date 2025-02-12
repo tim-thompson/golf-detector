@@ -16,14 +16,19 @@ class TrajectoryTracer:
         x = [p[0] for p in points]
         y = [p[1] for p in points]
         
-        # Fit spline
-        tck, u = splprep([x, y], s=smoothing_factor, k=3)
-        
-        # Generate more points for smooth curve
-        u_new = np.linspace(0, 1, len(points) * 5)
-        smooth_points = splev(u_new, tck)
-        
-        return np.column_stack((smooth_points[0], smooth_points[1])).astype(np.int32)
+        try:
+            # Try to fit spline
+            tck, u = splprep([x, y], s=smoothing_factor, k=min(3, len(points) - 1))
+            
+            # Generate more points for smooth curve
+            u_new = np.linspace(0, 1, len(points) * 5)
+            smooth_points = splev(u_new, tck)
+            
+            return np.column_stack((smooth_points[0], smooth_points[1])).astype(np.int32)
+        except ValueError:
+            # If spline fitting fails, return original points
+            print(f"Smoothing failed for {len(points)} points, using original trajectory")
+            return np.array(points)
     
     def draw_trajectory(self, frame: np.ndarray, trajectory: List[Tuple[int, int]], 
                        color: Union[str, Tuple[int, int, int]] = (255, 255, 255),
@@ -39,7 +44,7 @@ class TrajectoryTracer:
             color: Color in BGR format or color name string
             thickness: Line thickness
             alpha: Transparency of the trajectory (0-1)
-            line_style: OpenCV line style (e.g. cv2.LINE_AA, cv2.LINE_8)
+            line_style: OpenCV line style or 'dashed' for dashed lines
         """
         if len(trajectory) < 2:
             return frame
@@ -58,23 +63,54 @@ class TrajectoryTracer:
         # Create a separate layer for the trajectory
         overlay = frame.copy()
         
-        # Smooth the trajectory
-        smooth_trajectory = self._smooth_trajectory(trajectory)
+        # Smooth the trajectory if we have enough points
+        if len(trajectory) >= self.min_points_for_smoothing:
+            smooth_trajectory = self._smooth_trajectory(trajectory)
+        else:
+            smooth_trajectory = np.array(trajectory)
         
         # Draw the smooth curve
-        if line_style == cv2.LINE_DASHED:
-            # Create dashed line effect
-            for i in range(0, len(smooth_trajectory) - 1, 2):
+        if line_style == 'dashed':
+            # Create dashed line effect by drawing segments
+            dash_length = 10  # Length of each dash
+            gap_length = 5    # Length of gap between dashes
+            
+            for i in range(0, len(smooth_trajectory) - 1):
                 pt1 = tuple(smooth_trajectory[i])
-                pt2 = tuple(smooth_trajectory[min(i + 1, len(smooth_trajectory) - 1)])
-                cv2.line(
-                    overlay,
-                    pt1,
-                    pt2,
-                    color,
-                    thickness=thickness,
-                    lineType=cv2.LINE_AA
-                )
+                pt2 = tuple(smooth_trajectory[i + 1])
+                
+                # Calculate the vector between points
+                dx = pt2[0] - pt1[0]
+                dy = pt2[1] - pt1[1]
+                dist = np.sqrt(dx*dx + dy*dy)
+                
+                if dist < 1:  # Skip if points are too close
+                    continue
+                
+                # Normalize the vector
+                dx /= dist
+                dy /= dist
+                
+                # Draw dashed segments
+                pos = 0
+                while pos < dist:
+                    # Calculate segment start/end
+                    start_x = int(pt1[0] + dx * pos)
+                    start_y = int(pt1[1] + dy * pos)
+                    end_pos = min(pos + dash_length, dist)
+                    end_x = int(pt1[0] + dx * end_pos)
+                    end_y = int(pt1[1] + dy * end_pos)
+                    
+                    # Draw the dash
+                    cv2.line(overlay,
+                            (start_x, start_y),
+                            (end_x, end_y),
+                            color,
+                            thickness=thickness,
+                            lineType=cv2.LINE_AA)
+                    
+                    # Move to next segment
+                    pos += dash_length + gap_length
         else:
             # Draw solid line
             cv2.polylines(

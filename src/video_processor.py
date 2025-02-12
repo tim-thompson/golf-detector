@@ -38,7 +38,12 @@ class VideoProcessor:
         # Function to resize maintaining aspect ratio
         def resize_and_pad(img, target_size, pad_color=(0,0,0)):
             if img is None:
-                return np.zeros((target_size[1], target_size[0], 3), dtype=np.uint8)
+                # Create a black panel with "No Data" text
+                panel = np.zeros((target_size[1], target_size[0], 3), dtype=np.uint8)
+                cv2.putText(panel, "No Data", 
+                           (target_size[0]//3, target_size[1]//2),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                return panel
             
             h, w = img.shape[:2]
             scale = min(target_size[0]/w, target_size[1]/h)
@@ -72,20 +77,25 @@ class VideoProcessor:
             # Calculate panel position
             y_start = i * debug_panel_height
             
-            # Resize and place panel
-            if panel is not None:
-                resized_panel = resize_and_pad(panel, (debug_panel_width, debug_panel_height))
-                debug_canvas[y_start:y_start+debug_panel_height, main_width:] = resized_panel
+            # Create panel background
+            panel_bg = np.zeros((debug_panel_height, debug_panel_width, 3), dtype=np.uint8)
+            debug_canvas[y_start:y_start+debug_panel_height, main_width:] = panel_bg
             
             # Add panel label with dark background
             label_bg = np.zeros((30, debug_panel_width, 3), dtype=np.uint8)
             debug_canvas[y_start:y_start+30, main_width:] = label_bg
             
+            # Add label text
             cv2.putText(debug_canvas, label, 
                        (main_width + 10, y_start + 20),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            
+            # Resize and place panel
+            if panel is not None:
+                resized_panel = resize_and_pad(panel, (debug_panel_width, debug_panel_height-30))
+                debug_canvas[y_start+30:y_start+debug_panel_height, main_width:] = resized_panel
         
-        # Status panel at the bottom right
+        # Status panel at the bottom
         status_y_start = 4 * debug_panel_height
         status_panel = np.zeros((debug_panel_height, debug_panel_width, 3), dtype=np.uint8)
         
@@ -159,7 +169,7 @@ class VideoProcessor:
                         tracking_info['predicted_trajectory'],
                         color=(0, 255, 255),
                         thickness=2,
-                        line_style=cv2.LINE_DASHED
+                        line_style='dashed'
                     )
             
             # Draw current ball position
