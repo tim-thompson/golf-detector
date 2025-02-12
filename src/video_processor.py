@@ -162,15 +162,10 @@ class VideoProcessor:
                     thickness=2
                 )
                 
-                # Draw predicted trajectory
-                if tracking_info['predicted_trajectory']:
-                    self.trajectory_tracer.draw_trajectory(
-                        output_frame,
-                        tracking_info['predicted_trajectory'],
-                        color=(0, 255, 255),
-                        thickness=2,
-                        line_style='dashed'
-                    )
+                # Draw predicted trajectory if available
+                if tracking_info['prev_predicted_points']:
+                    for point in tracking_info['prev_predicted_points']:
+                        cv2.circle(output_frame, point, 3, (0, 255, 255), -1)
             
             # Draw current ball position
             if tracking_info['ball_pos']:

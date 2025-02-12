@@ -18,6 +18,8 @@ class BallTracker:
         self.ball_pos = None
         self.prev_frame = None
         self.trajectory = []
+        self.predicted_points = []  # Store predicted trajectory points separately
+        self.prev_predicted_points = []  # Store previous frame's predictions
         self.is_moving = False
         self.predicted_trajectory = []
         self.last_known_static_pos = None  # Store the last position where ball was static
@@ -25,6 +27,8 @@ class BallTracker:
         self.max_static_loss_frames = 2    # Reduced from 3 to 2 frames
         self.consecutive_misses = 0        # Counter for consecutive frames where ball was not detected
         self.max_consecutive_misses = 3    # Maximum consecutive misses before resetting
+        self.frames_since_lost = 0         # Counter for frames since ball was last detected
+        self.prediction_delay = 2          # Number of frames to wait before showing predictions
         
         # Motion detection parameters
         self.motion_threshold = 15        # Reduced threshold to detect subtle motion
@@ -285,27 +289,73 @@ class BallTracker:
         
         return mean_motion > self.motion_threshold, {'motion_diff': motion_diff}
     
-    def _predict_trajectory(self, points: List[Tuple[int, int]], num_points: int = 10) -> List[Tuple[int, int]]:
-        """Predict future trajectory points based on current trajectory."""
-        if len(points) < 3:
+    def _predict_next_points(self, points: List[Tuple[int, int]], num_points: int = 5) -> List[Tuple[int, int]]:
+        """Predict next trajectory points based on current trajectory."""
+        if len(points) < 2:
             return []
             
-        # Fit a quadratic curve to the points
-        x_coords = np.array([p[0] for p in points])
-        y_coords = np.array([p[1] for p in points])
-        t = np.arange(len(points))
+        # Use more points to calculate velocity and acceleration trends
+        num_points_to_use = min(5, len(points))  # Use up to last 5 points
+        points_for_calc = points[-num_points_to_use:]
         
-        # Fit x coordinates (linear)
-        x_coef = np.polyfit(t, x_coords, 1)
-        # Fit y coordinates (quadratic for parabolic motion)
-        y_coef = np.polyfit(t, y_coords, 2)
+        # If we have a predicted search area center, add it to the calculation points
+        if len(self.trajectory) >= 2:
+            # Calculate predicted search area center using last two points
+            p1 = self.trajectory[-2]
+            p2 = self.trajectory[-1]
+            dx = p2[0] - p1[0]
+            dy = p2[1] - p1[1]
+            gravity_factor = 2
+            predicted_x = int(p2[0] + dx)
+            predicted_y = int(p2[1] + dy + gravity_factor)
+            points_for_calc.append((predicted_x, predicted_y))
         
-        # Predict future points
-        future_t = np.arange(len(points), len(points) + num_points)
-        future_x = np.polyval(x_coef, future_t)
-        future_y = np.polyval(y_coef, future_t)
+        # Calculate velocities between consecutive points
+        velocities = []
+        for i in range(1, len(points_for_calc)):
+            p1 = points_for_calc[i-1]
+            p2 = points_for_calc[i]
+            dx = p2[0] - p1[0]
+            dy = p2[1] - p1[1]
+            velocities.append((dx, dy))
         
-        return [(int(x), int(y)) for x, y in zip(future_x, future_y)]
+        # Calculate average velocity and its trend
+        avg_dx = sum(v[0] for v in velocities) / len(velocities)
+        avg_dy = sum(v[1] for v in velocities) / len(velocities)
+        
+        # Calculate acceleration (change in velocity)
+        dy_changes = []
+        for i in range(1, len(velocities)):
+            dy_changes.append(velocities[i][1] - velocities[i-1][1])
+        
+        # If we have enough points, calculate vertical acceleration trend
+        if dy_changes:
+            avg_dy_change = sum(dy_changes) / len(dy_changes)
+        else:
+            avg_dy_change = 2  # Default gravity factor if not enough points
+        
+        # Get the last point as starting position
+        last_point = points_for_calc[-1]  # Use the last point including predicted center
+        x, y = last_point
+        
+        # Initialize current velocity components
+        current_dx = avg_dx
+        current_dy = avg_dy
+        
+        predicted_points = []
+        for i in range(num_points):
+            # Update position
+            x = int(x + current_dx)
+            y = int(y + current_dy)
+            predicted_points.append((x, y))
+            
+            # Update vertical velocity with acceleration trend
+            current_dy += avg_dy_change
+            
+            # Slightly reduce horizontal velocity (air resistance simulation)
+            current_dx *= 0.98
+        
+        return predicted_points
     
     def track_frame(self, frame: np.ndarray) -> Dict:
         """Track the ball in the current frame and return tracking information."""
@@ -353,7 +403,7 @@ class BallTracker:
                 print("Ball detected in static area - resetting motion tracking")
                 self.is_moving = False
                 self.trajectory = []
-                self.predicted_trajectory = []
+                self.predicted_points = []
             self.frames_since_static = 0
             self.last_known_static_pos = ball_pos
         else:
@@ -392,7 +442,7 @@ class BallTracker:
                     
                     self.is_moving = False
                     self.trajectory = []
-                    self.predicted_trajectory = []
+                    self.predicted_points = []
                     self.consecutive_misses = 0
                     self.frames_since_static = 0
                     # Add text to debug frame
@@ -402,13 +452,34 @@ class BallTracker:
         
         # Update ball position and trajectory
         self.ball_pos = ball_pos
-        if self.is_moving and ball_pos and (not self.trajectory or ball_pos != self.trajectory[-1]):
-            print(f"Adding new trajectory point: {ball_pos}")
-            self.trajectory.append(ball_pos)
-            self.predicted_trajectory = self._predict_trajectory(self.trajectory)
+        if self.is_moving:
+            if ball_pos:
+                # If we have a real detection, clear predictions and add the new point
+                if not self.trajectory or ball_pos != self.trajectory[-1]:
+                    print(f"Adding new trajectory point: {ball_pos}")
+                    self.trajectory.append(ball_pos)
+                    self.predicted_points = []  # Clear predictions when we get a new detection
+                    self.frames_since_lost = 0  # Reset frames since lost counter
+            else:
+                # Increment frames since lost counter
+                self.frames_since_lost += 1
+                print(f"Frames since lost: {self.frames_since_lost}")
+                
+                # Generate predictions after delay if we haven't already
+                if self.frames_since_lost >= self.prediction_delay and len(self.trajectory) >= 2:
+                    # Only generate new predictions if we don't have any
+                    if not self.predicted_points:
+                        print("Generating new predictions")
+                        self.predicted_points = self._predict_next_points(self.trajectory)
+                        print(f"Generated {len(self.predicted_points)} predicted points")
+                    # Store current predictions as previous predictions
+                    self.prev_predicted_points = self.predicted_points.copy()
+                else:
+                    print(f"Not generating predictions yet - need {self.prediction_delay} frames (currently at {self.frames_since_lost})")
         
         # Draw trajectory visualization
         if len(self.trajectory) > 1:
+            # Draw actual trajectory
             for i in range(1, len(self.trajectory)):
                 # Draw black border
                 cv2.line(debug_frame, 
@@ -421,7 +492,43 @@ class BallTracker:
                         self.trajectory[i],
                         (0, 255, 0), 2)
             
-            # Draw points and frame numbers along trajectory
+            # Draw predicted trajectory with faded effect (using previous frame's predictions)
+            if self.prev_predicted_points:
+                # Start from last actual point
+                last_actual = self.trajectory[-1]
+                for i, point in enumerate(self.prev_predicted_points):
+                    # Calculate fade factor based on prediction distance
+                    fade_factor = 0.7 * (1 - i/len(self.prev_predicted_points))  # Start at 70% opacity and fade out
+                    
+                    # Draw line from previous point
+                    prev_point = last_actual if i == 0 else self.prev_predicted_points[i-1]
+                    
+                    # Draw black border (also faded)
+                    border_color = (0, 0, 0)
+                    cv2.line(debug_frame, prev_point, point, border_color, 4)
+                    
+                    # Draw faded green line
+                    line_color = (0, int(255 * fade_factor), 0)
+                    cv2.line(debug_frame, prev_point, point, line_color, 2)
+                    
+                    # Draw faded point
+                    cv2.circle(debug_frame, point, 5, (0, 0, 0), -1)  # Black border
+                    point_color = (0, int(255 * fade_factor), int(255 * fade_factor))
+                    cv2.circle(debug_frame, point, 4, point_color, -1)
+                    
+                    # Draw frame number with fade
+                    text = f"{len(self.trajectory) + i}"
+                    (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+                    # Black outline
+                    cv2.putText(debug_frame, text,
+                              (point[0] - text_w//2, point[1] - 6),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 3)
+                    # Faded yellow text
+                    cv2.putText(debug_frame, text,
+                              (point[0] - text_w//2, point[1] - 6),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.4, point_color, 1)
+            
+            # Draw points and frame numbers for actual trajectory
             for i, point in enumerate(self.trajectory):
                 # Draw point with black border
                 cv2.circle(debug_frame, point, 5, (0, 0, 0), -1)  # Black border
@@ -501,7 +608,8 @@ class BallTracker:
             'ball_pos': self.ball_pos,
             'is_moving': self.is_moving,
             'trajectory': self.trajectory.copy(),
-            'predicted_trajectory': self.predicted_trajectory.copy(),
+            'predicted_points': self.predicted_points.copy() if self.predicted_points else [],
+            'prev_predicted_points': self.prev_predicted_points.copy() if self.prev_predicted_points else [],
             'debug_info': debug_info
         }
 
@@ -748,6 +856,8 @@ class BallTracker:
         self.ball_pos = None
         self.prev_frame = None
         self.trajectory = []
+        self.predicted_points = []
+        self.prev_predicted_points = []
         self.is_moving = False
         self.predicted_trajectory = []
         self.last_known_static_pos = None
@@ -756,4 +866,5 @@ class BallTracker:
         self.consecutive_misses = 0
         self.completed_trajectory = []
         self.frames_since_completion = 0
-        self.recent_motion_areas = [] 
+        self.recent_motion_areas = []
+        self.frames_since_lost = 0  # Reset frames since lost counter
